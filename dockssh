@@ -1,0 +1,115 @@
+#!/bin/bash
+
+# Check if running as root or with sudo
+if [[ $EUID -ne 0 ]]; then
+    echo "This script must be run as root or with sudo"
+    exit 1
+fi
+
+# Path to used_ports.txt file
+USED_PORTS_FILE="/etc/dockssh.d/used_ports.txt"
+CONFIG_DIR="/etc/dockssh.d"
+SCRIPT_PATH=$(realpath $0)
+
+# Function to populate used_ports.txt with ports currently in use
+populate_used_ports_file() {
+    # Extract ports currently in use and write to used_ports.txt
+    lsof -i -n -P | awk 'NR>1 {print $9}' | cut -d ':' -f 2 | sort -u > "$USED_PORTS_FILE"
+}
+
+# Function to generate a unique port not listed in used_ports.txt
+generate_unique_port() {
+    local port
+    while true; do
+        port=$(shuf -i 10000-65000 -n 1)
+        if ! grep -q "^$port$" "$USED_PORTS_FILE"; then
+            echo $port
+            return
+        fi
+    done
+}
+
+# Function to dynamically allocate an available host port for a service
+dockssh_allow() {
+    local container_name=$(hostname)
+    local container_port=$1
+    local port=$(generate_unique_port)
+    local config_file="$CONFIG_DIR/$container_name.conf"
+
+    if [ -f "$config_file" ]; then
+        echo "$port:$container_port" >> "$config_file"
+    else
+        echo $config_file
+        echo "Error: Configuration file for container '$container_name' does not exist."
+        exit 1
+    fi
+
+    echo "$port:$container_port"
+}
+
+# Function to create the container
+create_container() {
+    local name=$1
+    local password=$2
+    local port=$(generate_unique_port)
+    local host_ip=$(curl -s ifconfig.me)
+    local config_file="$CONFIG_DIR/$name.conf"
+
+    # Check if container with that name already exists
+    if docker ps -a --format '{{.Names}}' | grep -q "^$name$"; then
+        echo "Error: Container '$name' already exists."
+        exit 1
+    fi
+
+    # Create the config directory if it doesn't exist
+    mkdir -p "$CONFIG_DIR"
+
+    # Ensure used_ports.txt is populated with current ports in use
+    populate_used_ports_file
+
+    # Create the container with mounted volumes for config and used ports
+    docker run -d --name $name -h $name \
+        -p $port:22 \
+        -v "$CONFIG_DIR:$CONFIG_DIR" \
+        -v "$USED_PORTS_FILE:$USED_PORTS_FILE" \
+        -v "$SCRIPT_PATH:/bin/dockssh" \
+        ubuntu:latest bash -c "\
+        apt-get update && \
+        apt-get install -y openssh-server lsof && \
+        mkdir /var/run/sshd && \
+        echo 'root:$password' | chpasswd && \
+        sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+        sed -i 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' /etc/pam.d/sshd && \
+        echo 'export VISIBLE=now' >> /etc/profile && \
+        service ssh start && \
+        tail -f /dev/null"
+
+    # Allow some time for SSH to start
+    sleep 2
+
+    # Create a new config file for the container and add the initial SSH config
+    echo "[$name]" > "$config_file"
+    echo "$port:22" >> "$config_file"
+
+    # Output container details
+    echo "Container Name: $name"
+    echo "SSH Port (Container): $port"
+    echo "To SSH: ssh root@$host_ip -p $port"
+}
+
+
+# Main script logic
+if [ "$1" = "create" ] && [ -n "$2" ]; then
+    # Prompt for password
+    read -s -p "Enter password for the container: " password
+    echo
+    create_container "$2" "$password"
+elif [ "$1" = "allow" ] && [ -n "$2" ]; then
+    dockssh_allow "$2" "$3"
+else
+    echo "Usage:"
+    echo "  ./dockssh create <name>"
+    echo "  ./dockssh allow <port>"
+    exit 1
+fi
+
