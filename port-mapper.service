@@ -1,0 +1,14 @@
+[Unit]
+Description=Port Mapper Service
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+ExecStart=$HOME/dockssh/port_mapper.sh
+Restart=always
+User=root
+Group=root
+Environment="CONFIG_DIR=/etc/dockssh.d"
+
+[Install]
+WantedBy=multi-user.target
